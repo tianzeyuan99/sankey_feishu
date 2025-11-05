@@ -13,6 +13,7 @@ from .security import verify_signature
 # 北京时间 (UTC+8)
 BEIJING_TZ = timezone(timedelta(hours=8))
 from . import pull_bitable
+from . import cloud_doc_download
 import re
 
 # 先加载 .env（如果存在）
@@ -230,18 +231,19 @@ def get_beijing_timestamp() -> str:
 
 def generate_sankey_and_notify(excel_file_path: str, base_name: str) -> tuple[bool, str]:
     """生成桑基图
-    返回: (是否成功, HTML文件路径)
+    返回: (是否成功, HTML文件路径或错误类型)
+    错误类型: "format_error" 表示 Excel 格式不符合要求
     """
     app.logger.info(f"[桑基图生成] 开始处理，Excel文件: {excel_file_path}, Base名称: {base_name}")
     
     if SankeyService is None:
         app.logger.error("[桑基图生成] 失败：SankeyService 未初始化，可能是导入失败")
-        return False, "桑基图生成失败"
+        return False, "service_error"
     
     # 检查 Excel 文件是否存在
     if not os.path.exists(excel_file_path):
         app.logger.error(f"[桑基图生成] 失败：Excel文件不存在 - {excel_file_path}")
-        return False, "桑基图生成失败"
+        return False, "file_not_found"
     
     app.logger.info(f"[桑基图生成] Excel文件验证通过，文件大小: {os.path.getsize(excel_file_path)} bytes")
     
@@ -261,13 +263,19 @@ def generate_sankey_and_notify(excel_file_path: str, base_name: str) -> tuple[bo
         app.logger.info(f"[桑基图生成] 步骤1：开始转换预算文件为边表 - {os.path.basename(excel_file_path)}")
         try:
             edges_file_path = sankey_service.convert_budget_to_edges(excel_file_path)
+        except KeyError as e:
+            app.logger.exception(f"[桑基图生成] 步骤1失败：缺少必要的列 - {e}")
+            return False, "format_error"
+        except IndexError as e:
+            app.logger.exception(f"[桑基图生成] 步骤1失败：数据行不完整 - {e}")
+            return False, "format_error"
         except Exception as convert_err:
             app.logger.exception(f"[桑基图生成] 步骤1失败：转换预算文件时出错 - {convert_err}")
-            return False, "桑基图生成失败"
+            return False, "format_error"
         
         if not edges_file_path:
             app.logger.error("[桑基图生成] 步骤1失败：convert_budget_to_edges 返回 None")
-            return False, "桑基图生成失败"
+            return False, "format_error"
         
         if not os.path.exists(edges_file_path):
             app.logger.error(f"[桑基图生成] 步骤1失败：边表文件不存在 - {edges_file_path}")
@@ -500,22 +508,102 @@ def feishu_events():
                     f"{json.dumps(content, ensure_ascii=False)}\n"
                 )
 
-            # 检查是否是多维表格链接
+            # 检查链接类型
             is_bitable_link = isinstance(text, str) and "/base/" in text
-            print(f"[INFO] 检查是否为多维表格链接: is_bitable_link={is_bitable_link}, text={text}")
+            is_cloud_doc_link = isinstance(text, str) and (
+                "/file/" in text or "/docs/" in text or "/sheets/" in text
+            )
+            is_link = isinstance(text, str) and (
+                text.startswith("http://") or text.startswith("https://")
+            )
             
-            if not is_bitable_link:
-                # 不是多维表格链接，回复提示信息
+            app.logger.info(f"[消息处理] 链接类型检查: is_bitable={is_bitable_link}, is_cloud_doc={is_cloud_doc_link}, is_link={is_link}, text={text[:100]}")
+            
+            # 场景 1 和 2：不支持的链接类型或非链接消息
+            if not is_bitable_link and not is_cloud_doc_link:
                 if message_id:
                     try:
-                        reply_message(message_id, "该内容不能进行桑基图生成")
-                        app.logger.info(f"Replied '该内容不能进行桑基图生成' to message {message_id}")
+                        if not is_link:
+                            # 场景 2：非链接消息
+                            reply_message(message_id, "该内容不能进行桑基图生成，\n\n请发送多维表格链接或云文档链接")
+                            app.logger.info(f"[消息处理] 场景2：非链接消息，已回复，message_id: {message_id}")
+                        else:
+                            # 场景 1：不支持的链接类型
+                            reply_message(message_id, "该内容不能进行桑基图生成，\n\n请发送多维表格链接（/base/）或云文档链接（/file/、/docs/、/sheets/）")
+                            app.logger.info(f"[消息处理] 场景1：不支持的链接类型，已回复，message_id: {message_id}")
                     except Exception as e:
-                        app.logger.exception(f"Failed to reply message {message_id}: {e}")
+                        app.logger.exception(f"[消息处理] 发送错误消息失败，message_id: {message_id}, 错误: {e}")
                 return jsonify({"ok": "received"}), 200
             
+            # 处理云文档链接
+            if is_cloud_doc_link:
+                app.logger.info(f"[消息处理] 检测到云文档链接，开始处理，message_id: {message_id}")
+                try:
+                    token = get_tenant_access_token()
+                    
+                    # 提取 file_token
+                    try:
+                        file_token = cloud_doc_download.extract_file_token_from_link(text)
+                        app.logger.info(f"[消息处理] 提取到 file_token: {file_token}")
+                    except ValueError as e:
+                        app.logger.error(f"[消息处理] 云文档链接格式错误，message_id: {message_id}, 错误: {e}")
+                        reply_message(message_id, "云文档链接格式错误，请检查链接是否正确")
+                        return jsonify({"ok": "received"}), 200
+                    
+                    # 生成文件名
+                    ts = get_beijing_timestamp()
+                    outfile = os.path.join(OUTPUT_DIR, f"云文档-{sender_id}-{ts}.xlsx")
+                    
+                    # 下载云文档
+                    app.logger.info(f"[消息处理] 开始下载云文档，file_token: {file_token}, 输出文件: {outfile}")
+                    download_success, download_error = cloud_doc_download.download_cloud_doc_to_excel(
+                        file_token, outfile, token, OPEN_BASE
+                    )
+                    
+                    if not download_success:
+                        # 场景 3：下载失败（权限错误）
+                        app.logger.error(f"[消息处理] 场景3：云文档下载失败，message_id: {message_id}, 错误类型: {download_error}")
+                        if download_error == "permission_denied" or download_error == "file_not_found":
+                            reply_message(message_id, "文档访问失败，请检查：\n\n1. 链接是否正确\n\n2. 应用是否有访问权限\n\n3. 文件是否已分享给应用")
+                        else:
+                            reply_message(message_id, "云文档下载失败，请检查链接是否正确")
+                        return jsonify({"ok": "received"}), 200
+                    
+                    app.logger.info(f"[消息处理] 云文档下载成功，文件: {outfile}")
+                    
+                    # 生成桑基图
+                    base_name = "云文档"  # 使用默认名称
+                    app.logger.info(f"[消息处理] 开始生成桑基图，Excel文件: {outfile}, Base名称: {base_name}")
+                    sankey_success, sankey_result = generate_sankey_and_notify(outfile, base_name)
+                    
+                    # 只返回一次消息
+                    if sankey_success:
+                        app.logger.info(f"[消息处理] 桑基图生成成功，回复链接给用户，message_id: {message_id}")
+                        reply_message(message_id, f"桑基图链接：{sankey_result}")
+                    else:
+                        # 场景 4：Excel 格式不对
+                        if sankey_result == "format_error":
+                            app.logger.error(f"[消息处理] 场景4：Excel格式不符合要求，message_id: {message_id}")
+                            reply_message(message_id, "Excel 文件格式不符合要求，请确保文件包含：\n\n1. 第一列为时间列\n\n2. 后续列为成对的项目列和描述列\n\n3. 最后一列为总预算\n\n4. 数据行完整")
+                        else:
+                            app.logger.error(f"[消息处理] 桑基图生成失败，回复错误消息给用户，message_id: {message_id}, 结果: {sankey_result}")
+                            reply_message(message_id, "桑基图生成失败，请联系服务管理员")
+                    
+                    return jsonify({"ok": "received"}), 200
+                    
+                except ValueError as e:
+                    # 链接格式错误
+                    app.logger.error(f"[消息处理] 云文档链接格式错误，message_id: {message_id}, 错误: {e}")
+                    reply_message(message_id, "云文档链接格式错误，请检查链接是否正确")
+                    return jsonify({"ok": "received"}), 200
+                except Exception as e:
+                    # 其他异常
+                    app.logger.exception(f"[消息处理] 处理云文档失败，message_id: {message_id}, 错误: {e}")
+                    reply_message(message_id, "桑基图生成失败，请联系服务管理员")
+                    return jsonify({"ok": "received"}), 200
+            
             # 是多维表格链接，进行处理
-            print("[INFO] 检测到多维表格链接，开始处理")
+            app.logger.info(f"[消息处理] 检测到多维表格链接，开始处理，message_id: {message_id}")
             try:
                 # 带 table 参数的链接
                 if "?table=" in text:
@@ -558,10 +646,27 @@ def feishu_events():
                                 app.logger.info(f"[消息处理] 桑基图生成成功，回复链接给用户，message_id: {message_id}")
                                 reply_message(message_id, f"桑基图链接：{sankey_result}")  # 成功：返回标注后的链接
                             else:
-                                app.logger.error(f"[消息处理] 桑基图生成失败，回复错误消息给用户，message_id: {message_id}, 结果: {sankey_result}")
-                                reply_message(message_id, "桑基图生成失败，请联系服务管理员")  # 失败：统一错误信息
+                                # 场景 4：Excel 格式不对
+                                if sankey_result == "format_error":
+                                    app.logger.error(f"[消息处理] 场景4：Excel格式不符合要求，message_id: {message_id}")
+                                    reply_message(message_id, "Excel 文件格式不符合要求，请确保文件包含：\n\n1. 第一列为时间列\n\n2. 后续列为成对的项目列和描述列\n\n3. 最后一列为总预算\n\n4. 数据行完整")
+                                else:
+                                    app.logger.error(f"[消息处理] 桑基图生成失败，回复错误消息给用户，message_id: {message_id}, 结果: {sankey_result}")
+                                    reply_message(message_id, "桑基图生成失败，请联系服务管理员")
+                        except RuntimeError as e:
+                            # 场景 3：权限错误或 API 错误
+                            error_msg = str(e)
+                            app.logger.exception(f"[消息处理] 场景3：多维表格访问失败，message_id: {message_id}, 错误: {e}")
+                            try:
+                                if "code" in error_msg or "permission" in error_msg.lower() or "access" in error_msg.lower():
+                                    reply_message(message_id, "文档访问失败，请检查：\n\n1. 链接是否正确\n\n2. 应用是否有访问权限\n\n3. 文件是否已分享给应用")
+                                else:
+                                    reply_message(message_id, "多维表格拉取失败，请检查链接是否正确")
+                                app.logger.info(f"[消息处理] 已发送错误消息给用户，message_id: {message_id}")
+                            except Exception as reply_err:
+                                app.logger.exception(f"[消息处理] 发送错误消息失败，message_id: {message_id}, 错误: {reply_err}")
                         except Exception as e:
-                            # 拉取失败或其他异常
+                            # 其他异常
                             app.logger.exception(f"[消息处理] 拉取多维表格失败，message_id: {message_id}, 错误: {e}")
                             try:
                                 reply_message(message_id, "桑基图生成失败，请联系服务管理员")
@@ -573,7 +678,7 @@ def feishu_events():
                         app.logger.warning(f"[消息处理] app_token 或 table_id 解析失败，message_id: {message_id}, text: {text}")
                         if message_id:
                             try:
-                                reply_message(message_id, "桑基图生成失败，请联系服务管理员")
+                                reply_message(message_id, "多维表格链接格式错误，请检查链接是否正确")
                                 app.logger.info(f"[消息处理] 已发送错误消息（解析失败），message_id: {message_id}")
                             except Exception as reply_err:
                                 app.logger.exception(f"[消息处理] 发送错误消息失败，message_id: {message_id}, 错误: {reply_err}")
@@ -593,8 +698,21 @@ def feishu_events():
                             url_tables = f"{OPEN_BASE}/open-apis/bitable/v1/apps/{app_token}/tables"
                             params = {"page_size": 200}
                             rt = requests.get(url_tables, headers=headers, params=params, timeout=10).json()
-                            if rt.get("code") != 0 or not rt.get("data", {}).get("items"):
-                                raise RuntimeError(f"list tables failed: {rt}")
+                            if rt.get("code") != 0:
+                                # 场景 3：权限错误
+                                error_code = rt.get("code")
+                                error_msg = rt.get("msg", "")
+                                app.logger.error(f"[消息处理] 场景3：多维表格API错误，code: {error_code}, msg: {error_msg}")
+                                if error_code in [99991672, 99992354] or "permission" in error_msg.lower() or "access" in error_msg.lower():
+                                    reply_message(message_id, "文档访问失败，请检查：\n\n1. 链接是否正确\n\n2. 应用是否有访问权限\n\n3. 文件是否已分享给应用")
+                                else:
+                                    reply_message(message_id, "多维表格拉取失败，请检查链接是否正确")
+                                return jsonify({"ok": "received"}), 200
+                            
+                            if not rt.get("data", {}).get("items"):
+                                app.logger.error(f"[消息处理] 多维表格中没有表，message_id: {message_id}")
+                                reply_message(message_id, "多维表格中没有可用的表，请检查链接是否正确")
+                                return jsonify({"ok": "received"}), 200
                             tables = rt["data"]["items"]
                             table_id = None
                             if BASE_AUTO_PICK == "first" or not BASE_PREFERRED_TABLE:
@@ -650,10 +768,27 @@ def feishu_events():
                                 app.logger.info(f"[消息处理] 桑基图生成成功，回复链接给用户，message_id: {message_id}")
                                 reply_message(message_id, f"桑基图链接：{sankey_result}")  # 成功：返回标注后的链接
                             else:
-                                app.logger.error(f"[消息处理] 桑基图生成失败，回复错误消息给用户，message_id: {message_id}, 结果: {sankey_result}")
-                                reply_message(message_id, "桑基图生成失败，请联系服务管理员")  # 失败：统一错误信息
+                                # 场景 4：Excel 格式不对
+                                if sankey_result == "format_error":
+                                    app.logger.error(f"[消息处理] 场景4：Excel格式不符合要求，message_id: {message_id}")
+                                    reply_message(message_id, "Excel 文件格式不符合要求，请确保文件包含：\n\n1. 第一列为时间列\n\n2. 后续列为成对的项目列和描述列\n\n3. 最后一列为总预算\n\n4. 数据行完整")
+                                else:
+                                    app.logger.error(f"[消息处理] 桑基图生成失败，回复错误消息给用户，message_id: {message_id}, 结果: {sankey_result}")
+                                    reply_message(message_id, "桑基图生成失败，请联系服务管理员")
+                        except RuntimeError as e:
+                            # 场景 3：权限错误或 API 错误
+                            error_msg = str(e)
+                            app.logger.exception(f"[消息处理] 场景3：多维表格访问失败，message_id: {message_id}, 错误: {e}")
+                            try:
+                                if "code" in error_msg or "permission" in error_msg.lower() or "access" in error_msg.lower():
+                                    reply_message(message_id, "文档访问失败，请检查：\n\n1. 链接是否正确\n\n2. 应用是否有访问权限\n\n3. 文件是否已分享给应用")
+                                else:
+                                    reply_message(message_id, "多维表格拉取失败，请检查链接是否正确")
+                                app.logger.info(f"[消息处理] 已发送错误消息给用户，message_id: {message_id}")
+                            except Exception as reply_err:
+                                app.logger.exception(f"[消息处理] 发送错误消息失败，message_id: {message_id}, 错误: {reply_err}")
                         except Exception as e:
-                            # 拉取失败或其他异常
+                            # 其他异常
                             app.logger.exception(f"[消息处理] 自动拉取多维表格失败，message_id: {message_id}, 错误: {e}")
                             try:
                                 reply_message(message_id, "桑基图生成失败，请联系服务管理员")
@@ -665,7 +800,7 @@ def feishu_events():
                         app.logger.warning(f"[消息处理] app_token 解析失败，message_id: {message_id}, text: {text}")
                         if message_id:
                             try:
-                                reply_message(message_id, "桑基图生成失败，请联系服务管理员")
+                                reply_message(message_id, "多维表格链接格式错误，请检查链接是否正确")
                                 app.logger.info(f"[消息处理] 已发送错误消息（解析失败），message_id: {message_id}")
                             except Exception as reply_err:
                                 app.logger.exception(f"[消息处理] 发送错误消息失败，message_id: {message_id}, 错误: {reply_err}")
@@ -676,7 +811,7 @@ def feishu_events():
                 # 解析链接失败，也要返回错误消息
                 if message_id:
                     try:
-                        reply_message(message_id, "桑基图生成失败，请联系服务管理员")
+                        reply_message(message_id, "多维表格链接格式错误，请检查链接是否正确")
                         app.logger.info(f"[消息处理] 已发送错误消息（解析链接失败），message_id: {message_id}")
                     except Exception as reply_err:
                         app.logger.exception(f"[消息处理] 发送错误消息失败，message_id: {message_id}, 错误: {reply_err}")

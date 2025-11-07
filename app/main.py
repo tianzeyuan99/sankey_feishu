@@ -550,14 +550,13 @@ def feishu_events():
                         reply_message(message_id, "云文档链接格式错误，请检查链接是否正确")
                         return jsonify({"ok": "received"}), 200
                     
-                    # 生成文件名
+                    # 下载云文档（先下载，获取文件名后再重命名）
                     ts = get_beijing_timestamp()
-                    outfile = os.path.join(OUTPUT_DIR, f"云文档-{sender_id}-{ts}.xlsx")
+                    temp_outfile = os.path.join(OUTPUT_DIR, f"temp-{sender_id}-{ts}.xlsx")
                     
-                    # 下载云文档
-                    app.logger.info(f"[消息处理] 开始下载云文档，file_token: {file_token}, 输出文件: {outfile}")
-                    download_success, download_error = cloud_doc_download.download_cloud_doc_to_excel(
-                        file_token, outfile, token, OPEN_BASE
+                    app.logger.info(f"[消息处理] 开始下载云文档，file_token: {file_token}, 临时文件: {temp_outfile}")
+                    download_success, download_error, file_title = cloud_doc_download.download_cloud_doc_to_excel(
+                        file_token, temp_outfile, token, OPEN_BASE, doc_link=text
                     )
                     
                     if not download_success:
@@ -569,10 +568,29 @@ def feishu_events():
                             reply_message(message_id, "云文档下载失败，请检查链接是否正确")
                         return jsonify({"ok": "received"}), 200
                     
-                    app.logger.info(f"[消息处理] 云文档下载成功，文件: {outfile}")
+                    # 生成最终文件名（使用实际文件名或默认名称）
+                    if file_title:
+                        # 清理文件名（去除特殊字符）
+                        safe_name = re.sub(r'[<>:"/\\|?*]', '_', file_title)
+                        outfile = os.path.join(OUTPUT_DIR, f"{safe_name}-{sender_id}-{ts}.xlsx")
+                        base_name = file_title
+                    else:
+                        # 如果没有获取到文件名，使用默认名称
+                        outfile = os.path.join(OUTPUT_DIR, f"云文档-{sender_id}-{ts}.xlsx")
+                        base_name = "云文档"
+                    
+                    # 如果文件名不同，重命名文件
+                    if temp_outfile != outfile:
+                        try:
+                            os.rename(temp_outfile, outfile)
+                            app.logger.info(f"[消息处理] 文件已重命名: {temp_outfile} -> {outfile}")
+                        except Exception as e:
+                            app.logger.warning(f"[消息处理] 文件重命名失败，使用临时文件名: {e}")
+                            outfile = temp_outfile
+                    
+                    app.logger.info(f"[消息处理] 云文档下载成功，文件: {outfile}, 文件名: {base_name}")
                     
                     # 生成桑基图
-                    base_name = "云文档"  # 使用默认名称
                     app.logger.info(f"[消息处理] 开始生成桑基图，Excel文件: {outfile}, Base名称: {base_name}")
                     sankey_success, sankey_result = generate_sankey_and_notify(outfile, base_name)
                     

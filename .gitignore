@@ -40,6 +40,11 @@ Thumbs.db
 
 # Test/Development files
 1111.py
+test_*.py
+test_sheets_*.py
+test_drive_*.py
+test_download_*.py
+test_read_*.py
 
 # Output directories (运行时生成)
 output/

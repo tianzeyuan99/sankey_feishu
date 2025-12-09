@@ -696,6 +696,18 @@ class SankeyService:
                             "target": target_display,
                             "value": float(row[value_col])
                         })
+            
+            # 创建显示名称到描述的映射（用于HTML弹窗）
+            # 映射链：原始节点名称 -> 完整节点名称 -> 显示名称
+            display_name_to_description = {}
+            for original_name, description in node_descriptions.items():
+                # 原始节点名称 -> 完整节点名称（通过node_name_mapping）
+                full_name = node_name_mapping.get(original_name)
+                if full_name:
+                    # 完整节点名称 -> 显示名称（通过display_name_mapping）
+                    display_name = display_name_mapping.get(full_name)
+                    if display_name:
+                        display_name_to_description[display_name] = description
 
             c = (
                 Sankey(init_opts=opts.InitOpts(width="100%", height="100vh", page_title="动态桑基图"))
@@ -726,14 +738,14 @@ class SankeyService:
                     legend_opts=opts.LegendOpts(is_show=False)
                 )
             )
-            # 统一生成“完整 HTML 页面”，避免片段/完整混用导致的嵌套问题
+            # 统一生成"完整 HTML 页面"，避免片段/完整混用导致的嵌套问题
             c.render(output_html_path)
             # 如存在节点描述，则在完整 HTML 中注入弹窗 DOM 与脚本
-            if node_descriptions:
+            if display_name_to_description:
                 try:
                     with open(output_html_path, 'r', encoding='utf-8') as f:
                         generated_html = f.read()
-                    full_html = self.create_html_with_popup(generated_html, node_descriptions)
+                    full_html = self.create_html_with_popup(generated_html, display_name_to_description)
                     with open(output_html_path, 'w', encoding='utf-8') as f:
                         f.write(full_html)
                 except Exception as inject_err:

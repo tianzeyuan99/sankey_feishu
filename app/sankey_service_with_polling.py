@@ -238,8 +238,16 @@ class SankeyService:
         projects = set()
         for node in nodes:
             if '（' in node and '）' in node:
+                # 处理带金额的节点名称：项目名（会议：时间） 金额：xxx
                 project = node.split('（')[0]
                 projects.add(project)
+            elif not node.startswith('资源池'):
+                # 如果不是资源池节点，可能是其他格式，尝试提取项目名
+                # 如果节点名称包含"金额："，则提取前面的部分
+                if ' 金额：' in node:
+                    project = node.split(' 金额：')[0].split('（')[0]
+                    if project:
+                        projects.add(project)
         return sorted(list(projects))
 
     def load_project_descriptions(self, budget_file):
@@ -280,6 +288,35 @@ class SankeyService:
         except Exception as e:
             self.logger.error("读取预算文件时出错: {}".format(e))
             return {}
+
+    def load_node_amounts(self, budget_file):
+        """从预算文件加载每个节点的金额"""
+        if not os.path.exists(budget_file):
+            return {}
+        try:
+            budget_df = pd.read_excel(budget_file)
+            time_col = budget_df.columns[0]
+            project_cols = [budget_df.columns[i] for i in range(1, len(budget_df.columns) - 1, 2)]
+            meetings = budget_df[time_col].dropna().tolist()
+            meeting_mapping = {}
+            meeting_aliases = ["初始", "第一次", "第二次", "第三次", "第四次", "第五次"]
+            for i, meeting in enumerate(meetings):
+                meeting_mapping[meeting] = meeting_aliases[i] if i < len(meeting_aliases) else f"第{i+1}次"
+            node_amounts = {}
+            for meeting in meetings:
+                simplified_meeting = meeting_mapping[meeting]
+                for project_col in project_cols:
+                    project_name = project_col
+                    value = budget_df[budget_df[time_col] == meeting][project_col].iloc[0]
+                    amount = value if pd.notnull(value) else 0
+                    meeting_time = meeting.split('(')[1].split(')')[0] if '(' in meeting else meeting
+                    node_name = f"{project_name}（{simplified_meeting}：{meeting_time}）"
+                    node_amounts[node_name] = float(amount)
+            return node_amounts
+        except Exception as e:
+            self.logger.error("读取节点金额时出错: {}".format(e))
+            return {}
+
 
     def create_html_with_popup(self, echarts_html: str, node_descriptions: dict) -> str:
         """
@@ -464,7 +501,12 @@ class SankeyService:
         if bool(re.match(pattern, str(node_name))):
             node["itemStyle"] = {"color": "#B0B0B0"}
         elif project_colors:
-            project_name = node_name.split('（')[0] if '（' in node_name else node_name
+            # 处理带金额的节点名称：项目名（会议：时间） 金额：xxx
+            # 提取项目名称（去掉金额部分）
+            if ' 金额：' in node_name:
+                project_name = node_name.split(' 金额：')[0].split('（')[0]
+            else:
+                project_name = node_name.split('（')[0] if '（' in node_name else node_name
             if project_name in project_colors:
                 node["itemStyle"] = {"color": project_colors[project_name]}
         if node_descriptions and node_name in node_descriptions:
@@ -499,13 +541,47 @@ class SankeyService:
                 self.logger.warning("没有有效数据")
                 return False
             node_descriptions = {}
+            node_amounts = {}
             if budget_path and os.path.exists(budget_path):
                 node_descriptions = self.load_project_descriptions(budget_path)
+                node_amounts = self.load_node_amounts(budget_path)
+            
+            # 创建节点名称到带金额的节点名称的映射
+            node_name_mapping = {}
+            nodes_set = set(valid_df['source']).union(set(valid_df['target']))
+            for node_name in nodes_set:
+                if node_name in node_amounts:
+                    amount = node_amounts[node_name]
+                    # 格式化金额：如果是整数显示整数，否则显示2位小数
+                    if amount == int(amount):
+                        amount_str = f"{int(amount):,}"
+                    else:
+                        amount_str = f"{amount:,.2f}"
+                    new_node_name = f"{node_name} 金额：{amount_str}"
+                    node_name_mapping[node_name] = new_node_name
+                else:
+                    # 如果没有找到金额，保持原名称（资源池等节点）
+                    node_name_mapping[node_name] = node_name
+            
+            # 更新 edges 中的节点名称
+            valid_df = valid_df.copy()
+            valid_df['source'] = valid_df['source'].map(node_name_mapping)
+            valid_df['target'] = valid_df['target'].map(node_name_mapping)
+            
+            # 更新节点集合
             nodes_set = set(valid_df['source']).union(set(valid_df['target']))
             projects = self.extract_projects_from_nodes(list(nodes_set))
             project_colors = {p: COLOR_PALETTE[i % len(COLOR_PALETTE)] for i, p in enumerate(projects)}
-            nodes = [self.create_node_with_style(n, node_descriptions, project_colors) for n in sorted(nodes_set)]
+            
+            # 更新节点描述映射（使用新的节点名称）
+            updated_node_descriptions = {}
+            for old_name, new_name in node_name_mapping.items():
+                if old_name in node_descriptions:
+                    updated_node_descriptions[new_name] = node_descriptions[old_name]
+            
+            nodes = [self.create_node_with_style(n, updated_node_descriptions, project_colors) for n in sorted(nodes_set)]
             links = [{"source": row['source'], "target": row['target'], "value": float(row[value_col])} for _, row in valid_df.iterrows()]
+
             c = (
                 Sankey(init_opts=opts.InitOpts(width="100%", height="100vh", page_title="动态桑基图"))
                 .add(

@@ -317,6 +317,38 @@ class SankeyService:
             self.logger.error("读取节点金额时出错: {}".format(e))
             return {}
 
+    def compute_phase_totals(self, budget_file):
+        """按会议读取"总预算"(最后一列)，返回 (别名, 会议名称, 总预算) 列表，用于标题下方展示"""
+        if not os.path.exists(budget_file):
+            return []
+        try:
+            budget_df = pd.read_excel(budget_file)
+            time_col = budget_df.columns[0]
+            total_col = budget_df.columns[-1]  # 最后一列：总预算
+
+            meetings = budget_df[time_col].dropna().tolist()
+            meeting_aliases = ["初始", "第一次", "第二次", "第三次", "第四次", "第五次"]
+            phase_info = []  # [(alias, phase_name, total), ...]
+
+            for i, meeting in enumerate(meetings):
+                alias = meeting_aliases[i] if i < len(meeting_aliases) else f"第{i+1}次"
+                # 会议名称：用括号内的时间说明；如果没有括号就用整串
+                if "(" in str(meeting) and ")" in str(meeting):
+                    phase_name = str(meeting).split("(", 1)[1].rsplit(")", 1)[0]
+                else:
+                    phase_name = str(meeting)
+
+                row = budget_df[budget_df[time_col] == meeting]
+                v = row[total_col].iloc[0]
+                if pd.notnull(v):
+                    try:
+                        phase_info.append((alias, phase_name, float(v)))
+                    except Exception:
+                        continue
+            return phase_info
+        except Exception as e:
+            self.logger.error("读取会议总预算(最后一列)时出错: {}".format(e))
+            return []
 
     def create_html_with_popup(self, echarts_html: str, node_descriptions: dict) -> str:
         """
@@ -520,6 +552,36 @@ class SankeyService:
         else:
             return "桑基图"
 
+    def _format_phase_totals_subtitle(self, phase_totals):
+        """格式化会议总预算副标题：别名：会议名称 合计：xxx"""
+        if not phase_totals:
+            return ""
+        subtitle_parts = []
+        for alias, phase_name, total in phase_totals:
+            # 格式化金额：如果是整数显示整数，否则显示2位小数
+            if total == int(total):
+                total_str = f"{int(total):,}"
+            else:
+                total_str = f"{total:,.2f}"
+            subtitle_parts.append(f"{alias}：{phase_name} 合计：{total_str}")
+        return " | ".join(subtitle_parts)
+
+    def _calculate_subtitle_font_size(self, phase_totals):
+        """根据副标题内容长度计算字体大小，确保美观"""
+        if not phase_totals:
+            return 12
+        subtitle_text = self._format_phase_totals_subtitle(phase_totals)
+        text_length = len(subtitle_text)
+        # 根据长度自适应字体大小
+        if text_length <= 50:
+            return 14
+        elif text_length <= 100:
+            return 12
+        elif text_length <= 150:
+            return 10
+        else:
+            return 9
+
     def send_feishu_notification(self, html_file_path, budget_file_name):
         # 留空：由上层服务决定是否通知
         pass
@@ -542,12 +604,16 @@ class SankeyService:
                 return False
             node_descriptions = {}
             node_amounts = {}
+            phase_totals = []  # 会议总预算列表
             if budget_path and os.path.exists(budget_path):
                 node_descriptions = self.load_project_descriptions(budget_path)
                 node_amounts = self.load_node_amounts(budget_path)
+                phase_totals = self.compute_phase_totals(budget_path)  # 加载会议总预算
             
             # 创建节点名称到带金额的节点名称的映射
             node_name_mapping = {}
+            # 创建显示名称映射（去掉时间，加上数字符号）
+            display_name_mapping = {}
             nodes_set = set(valid_df['source']).union(set(valid_df['target']))
             for node_name in nodes_set:
                 if node_name in node_amounts:
@@ -559,9 +625,35 @@ class SankeyService:
                         amount_str = f"{amount:,.2f}"
                     new_node_name = f"{node_name} 金额：{amount_str}"
                     node_name_mapping[node_name] = new_node_name
+                    
+                    # 生成显示名称：去掉时间，加上数字符号
+                    if '（' in node_name and '）' in node_name:
+                        project = node_name.split('（')[0]
+                        # 提取阶段别名（如"第一次"、"第二次"）
+                        meeting_part = node_name.split('（')[1].split('）')[0]
+                        if '：' in meeting_part:
+                            phase_alias = meeting_part.split('：')[0]  # 提取"第一次"
+                        else:
+                            phase_alias = meeting_part
+                        # 阶段别名到数字符号的映射（从①开始）
+                        phase_symbol_map = {
+                            "初始": "①",
+                            "第一次": "②",
+                            "第二次": "③",
+                            "第三次": "④",
+                            "第四次": "⑤",
+                            "第五次": "⑥"
+                        }
+                        symbol = phase_symbol_map.get(phase_alias, "①")  # 默认用①
+                        # 显示名称格式：符号项目名：金额数字（去掉"金额："文字）
+                        display_name = f"{symbol}{project}：{amount_str}"
+                    else:
+                        display_name = new_node_name
+                    display_name_mapping[new_node_name] = display_name
                 else:
                     # 如果没有找到金额，保持原名称（资源池等节点）
                     node_name_mapping[node_name] = node_name
+                    display_name_mapping[node_name] = node_name
             
             # 更新 edges 中的节点名称
             valid_df = valid_df.copy()
@@ -579,8 +671,31 @@ class SankeyService:
                 if old_name in node_descriptions:
                     updated_node_descriptions[new_name] = node_descriptions[old_name]
             
-            nodes = [self.create_node_with_style(n, updated_node_descriptions, project_colors) for n in sorted(nodes_set)]
-            links = [{"source": row['source'], "target": row['target'], "value": float(row[value_col])} for _, row in valid_df.iterrows()]
+            # 创建节点时使用显示名称
+            nodes = []
+            for data_name in sorted(nodes_set):
+                display_name = display_name_mapping.get(data_name, data_name)
+                node_dict = self.create_node_with_style(data_name, updated_node_descriptions, project_colors)
+                # 修改节点名称为显示名称
+                node_dict['name'] = display_name
+                # 如果完整名称有描述，保留描述
+                if data_name in updated_node_descriptions:
+                    node_dict['description'] = updated_node_descriptions[data_name]
+                nodes.append(node_dict)
+            
+            # 更新links中的节点名称，使用显示名称
+            links = []
+            for _, row in valid_df.iterrows():
+                if row['source'] != row['target']:  # 过滤原始数据的自循环
+                    source_display = display_name_mapping.get(row['source'], row['source'])
+                    target_display = display_name_mapping.get(row['target'], row['target'])
+                    # 额外过滤：如果显示名称相同，也会形成自循环，需要过滤掉
+                    if source_display != target_display:
+                        links.append({
+                            "source": source_display,
+                            "target": target_display,
+                            "value": float(row[value_col])
+                        })
 
             c = (
                 Sankey(init_opts=opts.InitOpts(width="100%", height="100vh", page_title="动态桑基图"))
@@ -592,13 +707,22 @@ class SankeyService:
                     node_align="justify",
                     node_gap=15,
                     node_width=15,
+                    pos_top="8%",  # 为标题和副标题留出空间
                     linestyle_opt=opts.LineStyleOpts(opacity=0.6, curve=0.5, color="source"),
                     label_opts=opts.LabelOpts(position="right", formatter="{b}", font_size=9),
                     itemstyle_opts=opts.ItemStyleOpts(border_width=1, border_color="#ccc", opacity=0.9)
                 )
                 .set_global_opts(
-                    title_opts=opts.TitleOpts(title=self.get_chart_title(budget_path), pos_left="center", title_textstyle_opts=opts.TextStyleOpts(font_size=18)),
-                    tooltip_opts=opts.TooltipOpts(trigger="item", trigger_on="mousemove", formatter="{b}: {c}"),
+                    title_opts=opts.TitleOpts(
+                        title=self.get_chart_title(budget_path), 
+                        pos_left="center", 
+                        title_textstyle_opts=opts.TextStyleOpts(font_size=18),
+                        subtitle=self._format_phase_totals_subtitle(phase_totals) if phase_totals else "",
+                        subtitle_textstyle_opts=opts.TextStyleOpts(
+                            font_size=self._calculate_subtitle_font_size(phase_totals)
+                        )
+                    ),
+                    tooltip_opts=opts.TooltipOpts(trigger="item", trigger_on="mousemove", formatter="{b}"),
                     legend_opts=opts.LegendOpts(is_show=False)
                 )
             )

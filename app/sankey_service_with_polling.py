@@ -671,9 +671,66 @@ class SankeyService:
                 if old_name in node_descriptions:
                     updated_node_descriptions[new_name] = node_descriptions[old_name]
             
-            # 创建节点时使用显示名称
+            # 获取表格中的项目顺序和会议顺序（用于节点排序）
+            project_order = []
+            meeting_order = []
+            meeting_alias_map = {}
+            if budget_path and os.path.exists(budget_path):
+                try:
+                    budget_df = pd.read_excel(budget_path)
+                    time_col = budget_df.columns[0]
+                    # 项目列是索引 1, 3, 5...（与 load_node_amounts 保持一致）
+                    project_order = [budget_df.columns[i] for i in range(1, len(budget_df.columns) - 1, 2)]
+                    # 获取会议顺序
+                    meeting_order = budget_df[time_col].dropna().tolist()
+                    # 创建会议别名映射
+                    meeting_aliases = ["初始", "第一次", "第二次", "第三次", "第四次", "第五次"]
+                    for i, meeting in enumerate(meeting_order):
+                        meeting_alias_map[meeting] = meeting_aliases[i] if i < len(meeting_aliases) else f"第{i+1}次"
+                    self.logger.info(f"节点排序：项目顺序={project_order}, 会议顺序={meeting_order}")
+                except Exception as e:
+                    self.logger.warning("读取表格顺序失败: {}".format(e))
+            
+            # 自定义排序函数：按照表格顺序排序
+            def sort_nodes_by_table_order(node_name):
+                """按照表格中的顺序排序节点：先按会议顺序，再按项目顺序"""
+                # 先去掉" 金额：xxx"部分（如果存在）
+                base_name = node_name.split(' 金额：')[0] if ' 金额：' in node_name else node_name
+                
+                if '（' in base_name and '）' in base_name:
+                    project = base_name.split('（')[0].strip()  # 去除前后空格
+                    meeting_part = base_name.split('（')[1].split('）')[0]
+                    if '：' in meeting_part:
+                        phase_alias = meeting_part.split('：')[0]
+                    else:
+                        phase_alias = meeting_part
+                    
+                    # 获取会议在表格中的顺序
+                    meeting_index = len(meeting_order)  # 默认排在最后
+                    for meeting, alias in meeting_alias_map.items():
+                        if alias == phase_alias:
+                            if meeting in meeting_order:
+                                meeting_index = meeting_order.index(meeting)
+                            break
+                    
+                    # 获取项目在表格中的顺序（精确匹配，去除空格，处理类型）
+                    project_index = len(project_order)  # 默认排在最后
+                    for i, proj in enumerate(project_order):
+                        # 统一转换为字符串并去除空格，处理可能的数字类型
+                        if str(proj).strip() == str(project).strip():
+                            project_index = i
+                            break
+                    
+                    # 返回排序键：(会议顺序, 项目顺序)
+                    return (meeting_index, project_index)
+                else:
+                    # 资源池等节点排在最后
+                    return (999, 999)
+            
+            # 创建节点时使用显示名称，按表格顺序排序
             nodes = []
-            for data_name in sorted(nodes_set):
+            sorted_nodes = sorted(nodes_set, key=sort_nodes_by_table_order) if project_order and meeting_order else sorted(nodes_set)
+            for data_name in sorted_nodes:
                 display_name = display_name_mapping.get(data_name, data_name)
                 node_dict = self.create_node_with_style(data_name, updated_node_descriptions, project_colors)
                 # 修改节点名称为显示名称
@@ -719,6 +776,7 @@ class SankeyService:
                     node_align="justify",
                     node_gap=15,
                     node_width=15,
+                    layout_iterations=0,  # 禁用自动布局优化，让节点按照links数组的顺序排列
                     pos_top="8%",  # 为标题和副标题留出空间
                     linestyle_opt=opts.LineStyleOpts(opacity=0.6, curve=0.5, color="source"),
                     label_opts=opts.LabelOpts(position="right", formatter="{b}", font_size=9),

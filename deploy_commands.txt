@@ -1,0 +1,161 @@
+# 飞书机器人部署命令（直接在服务器上执行）
+
+# 0. 检查压缩包
+echo "=== 检查压缩包 ==="
+cd /home/cnooc/python_app
+if [ ! -f feishu-bitable-receiver.tar.gz ]; then
+    echo "❌ 错误: 压缩包不存在: feishu-bitable-receiver.tar.gz"
+    exit 1
+fi
+echo "✅ 压缩包存在: $(ls -lh feishu-bitable-receiver.tar.gz | awk '{print $5}')"
+echo ""
+
+# 1. 停止服务
+echo "=== 停止服务 ==="
+if [ -d "/home/cnooc/python_app/feishu-bitable-receiver" ]; then
+    cd /home/cnooc/python_app/feishu-bitable-receiver
+    if [ -f gunicorn.pid ]; then
+        kill $(cat gunicorn.pid) 2>/dev/null || true
+    fi
+fi
+pkill -f "gunicorn .*wsgi:app" || true
+pkill -f "python sankey_service_with_polling.py" || true
+sleep 2
+echo "✅ 服务已停止"
+echo ""
+
+# 2. 备份当前版本
+echo "=== 备份当前版本 ==="
+BACKUP_DIR="/home/cnooc/python_app/feishu-bitable-receiver.backup.$(date +%Y%m%d_%H%M%S)"
+if [ -d "/home/cnooc/python_app/feishu-bitable-receiver" ]; then
+    mv /home/cnooc/python_app/feishu-bitable-receiver "$BACKUP_DIR"
+    echo "✅ 已备份到: $BACKUP_DIR"
+else
+    echo "⚠ 项目目录不存在，跳过备份"
+    BACKUP_DIR=""
+fi
+echo ""
+
+# 3. 解压新版本
+echo "=== 解压新版本 ==="
+cd /home/cnooc/python_app
+tar xzf feishu-bitable-receiver.tar.gz
+if [ $? -ne 0 ]; then
+    echo "❌ 解压失败"
+    exit 1
+fi
+if [ ! -d "feishu-bitable-receiver" ]; then
+    echo "❌ 错误: 解压后目录不存在"
+    exit 1
+fi
+echo "✅ 解压成功"
+echo ""
+
+# 4. 进入项目目录并恢复配置
+echo "=== 恢复配置 ==="
+cd /home/cnooc/python_app/feishu-bitable-receiver
+if [ -n "$BACKUP_DIR" ] && [ -f "$BACKUP_DIR/.env" ]; then
+    cp "$BACKUP_DIR/.env" .env
+    echo "✅ 已恢复 .env 文件"
+else
+    echo "⚠ 请检查 .env 文件是否存在"
+fi
+echo ""
+
+# 5. 创建必要的目录
+echo "=== 创建目录 ==="
+mkdir -p logs /home/cnooc/file/excel /home/cnooc/file/sankey
+echo "✅ 目录创建完成"
+echo ""
+
+# 6. 验证关键文件
+echo "=== 验证关键文件 ==="
+if [ ! -f "wsgi.py" ]; then
+    echo "❌ 错误: wsgi.py 不存在"
+    exit 1
+fi
+if [ ! -f "app/main.py" ]; then
+    echo "❌ 错误: app/main.py 不存在"
+    exit 1
+fi
+if [ ! -f "requirements.txt" ]; then
+    echo "❌ 错误: requirements.txt 不存在"
+    exit 1
+fi
+echo "✅ 关键文件存在"
+echo ""
+
+# 7. 安装/更新依赖
+echo "=== 安装/更新依赖 ==="
+source /home/cnooc/python_app/venv313/bin/activate
+cd /home/cnooc/python_app/feishu-bitable-receiver
+pip install -r requirements.txt --quiet
+if [ $? -ne 0 ]; then
+    echo "❌ 依赖安装失败"
+    exit 1
+fi
+echo "✅ 依赖安装完成"
+echo ""
+
+# 8. 测试Python导入
+echo "=== 测试Python导入 ==="
+cd /home/cnooc/python_app/feishu-bitable-receiver
+python3 -c "from app.main import app; print('✅ 导入成功')" 2>&1
+if [ $? -ne 0 ]; then
+    echo "❌ Python导入失败，请检查错误信息"
+    exit 1
+fi
+echo ""
+
+# 9. 启动服务
+echo "=== 启动服务 ==="
+cd /home/cnooc/python_app/feishu-bitable-receiver
+nohup gunicorn -w 3 --threads 2 --timeout 120 -b 0.0.0.0:3000 \
+  --access-logfile ./logs/access.log \
+  --error-logfile  ./logs/error.log  \
+  --log-level info --capture-output \
+  wsgi:app >/dev/null 2>&1 &
+GUNICORN_PID=$!
+echo $GUNICORN_PID > gunicorn.pid
+sleep 3
+
+# 检查进程是否启动
+if ps -p $GUNICORN_PID > /dev/null 2>&1; then
+    echo "✅ Gunicorn 进程已启动 (PID: $GUNICORN_PID)"
+else
+    echo "❌ Gunicorn 进程启动失败"
+    echo "错误日志:"
+    tail -20 logs/error.log 2>/dev/null || echo "无法读取日志"
+    exit 1
+fi
+echo ""
+
+# 10. 验证服务
+echo "=== 验证服务 ==="
+sleep 2
+echo "进程状态:"
+ps -ef | grep 'gunicorn .*wsgi:app' | grep -v grep | head -2
+echo ""
+echo "端口监听:"
+ss -ltnp | grep 3000 || netstat -ltnp | grep 3000 || echo "⚠ 端口未监听"
+echo ""
+echo "健康检查:"
+for i in {1..3}; do
+    if curl -s http://127.0.0.1:3000/healthz > /dev/null 2>&1; then
+        echo "✅ 健康检查通过"
+        break
+    else
+        if [ $i -eq 3 ]; then
+            echo "❌ 健康检查失败"
+            echo "查看错误日志:"
+            tail -30 logs/error.log 2>/dev/null
+        else
+            echo "等待服务启动... ($i/3)"
+            sleep 2
+        fi
+    fi
+done
+echo ""
+
+echo "✅ 部署完成！"
+

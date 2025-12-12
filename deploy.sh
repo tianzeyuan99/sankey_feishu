@@ -53,43 +53,89 @@ echo "正在连接服务器并执行部署命令..."
 
 # 部署命令
 DEPLOY_SCRIPT=$(cat << 'DEPLOY_EOF'
-cd /home/cnooc/python_app/feishu-bitable-receiver
+PROJECT_DIR="/home/cnooc/python_app/feishu-bitable-receiver"
+TAR_FILE="/home/cnooc/python_app/feishu-bitable-receiver.tar.gz"
 
 # 停止服务
 echo "停止服务..."
-kill $(cat gunicorn.pid) 2>/dev/null || pkill -f "gunicorn .*wsgi:app" || true
+if [ -d "$PROJECT_DIR" ]; then
+    cd "$PROJECT_DIR"
+    kill $(cat gunicorn.pid) 2>/dev/null || true
+fi
+pkill -f "gunicorn .*wsgi:app" || true
 pkill -f "python sankey_service_with_polling.py" || true
 sleep 2
 
 # 备份当前版本
 echo "备份当前版本..."
 BACKUP_DIR="/home/cnooc/python_app/feishu-bitable-receiver.backup.$(date +%Y%m%d_%H%M%S)"
-[ -d "/home/cnooc/python_app/feishu-bitable-receiver" ] && mv /home/cnooc/python_app/feishu-bitable-receiver "$BACKUP_DIR" || true
+if [ -d "$PROJECT_DIR" ]; then
+    mv "$PROJECT_DIR" "$BACKUP_DIR"
+    echo "✅ 已备份到: $BACKUP_DIR"
+else
+    echo "⚠ 项目目录不存在，跳过备份"
+    BACKUP_DIR=""
+fi
 
 # 解压新版本
 echo "解压新版本..."
 cd /home/cnooc/python_app
+if [ ! -f "$TAR_FILE" ]; then
+    echo "❌ 错误: 压缩包不存在: $TAR_FILE"
+    exit 1
+fi
 tar xzf feishu-bitable-receiver.tar.gz
+
+# 确认解压成功
+if [ ! -d "$PROJECT_DIR" ]; then
+    echo "❌ 错误: 解压后项目目录不存在: $PROJECT_DIR"
+    exit 1
+fi
 
 # 恢复配置和创建目录
 echo "恢复配置..."
-cd /home/cnooc/python_app/feishu-bitable-receiver
-[ -f "$BACKUP_DIR/.env" ] && cp "$BACKUP_DIR/.env" .env || echo "⚠ 请检查 .env 文件"
+cd "$PROJECT_DIR"
+if [ -n "$BACKUP_DIR" ] && [ -f "$BACKUP_DIR/.env" ]; then
+    cp "$BACKUP_DIR/.env" .env
+    echo "✅ 已恢复 .env 文件"
+else
+    echo "⚠ 请检查 .env 文件是否存在"
+fi
 mkdir -p logs /home/cnooc/file/excel /home/cnooc/file/sankey
 
 # 安装/更新依赖
 echo "安装/更新依赖..."
 source /home/cnooc/python_app/venv313/bin/activate
+if [ ! -f "requirements.txt" ]; then
+    echo "❌ 错误: requirements.txt 不存在"
+    exit 1
+fi
 pip install -r requirements.txt --quiet
+if [ $? -ne 0 ]; then
+    echo "❌ 依赖安装失败"
+    exit 1
+fi
+echo "✅ 依赖安装完成"
 
 # 启动服务
 echo "启动服务..."
+cd "$PROJECT_DIR"
 nohup gunicorn -w 3 --threads 2 --timeout 120 -b 0.0.0.0:3000 \
   --access-logfile ./logs/access.log \
   --error-logfile  ./logs/error.log  \
   --log-level info --capture-output \
   wsgi:app >/dev/null 2>&1 &
 echo $! > gunicorn.pid
+sleep 2
+
+# 检查进程是否启动
+if ps -p $(cat gunicorn.pid) > /dev/null 2>&1; then
+    echo "✅ Gunicorn 进程已启动 (PID: $(cat gunicorn.pid))"
+else
+    echo "❌ Gunicorn 进程启动失败，查看错误日志:"
+    tail -20 ./logs/error.log 2>/dev/null || echo "无法读取日志"
+    exit 1
+fi
 
 # 验证服务
 sleep 3

@@ -40,10 +40,10 @@ def extract_file_token_from_link(doc_link: str) -> str:
 
 
 def download_sheets_via_read(file_token: str, output_path: str, tenant_token: str, open_base: str) -> tuple[bool, Optional[str], Optional[str]]:
-    """通过读取接口获取 sheets 数据并转换为 Excel
+    """通过读取接口获取 sheets 数据并转换为 Excel（支持多sheet）
     
-    使用 v2/spreadsheets/{token}/metainfo 接口获取 sheet_id，
-    然后使用 v2/spreadsheets/{token}/values/{sheet_id} 读取数据。
+    使用 v2/spreadsheets/{token}/metainfo 接口获取所有 sheet_id，
+    然后使用 v2/spreadsheets/{token}/values/{sheet_id} 读取每个sheet的数据。
     
     Args:
         file_token: Sheets 的 file_token
@@ -60,16 +60,16 @@ def download_sheets_via_read(file_token: str, output_path: str, tenant_token: st
     }
     
     try:
-        # 步骤1: 使用 v2/metainfo 接口获取表格元数据，获取第一个 sheet_id
+        # 步骤1: 使用 v2/metainfo 接口获取表格元数据，获取所有 sheet
         metadata_url = f"{open_base}/open-apis/sheets/v2/spreadsheets/{file_token}/metainfo"
         resp = requests.get(metadata_url, headers=headers, timeout=30)
         
         if resp.status_code == 403:
-            return False, "permission_denied"
+            return False, "permission_denied", None
         if resp.status_code == 404:
-            return False, "file_not_found"
+            return False, "file_not_found", None
         if resp.status_code != 200:
-            return False, f"api_error: status_code={resp.status_code}"
+            return False, f"api_error: status_code={resp.status_code}", None
         
         metadata = resp.json()
         if metadata.get("code") != 0:
@@ -85,47 +85,74 @@ def download_sheets_via_read(file_token: str, output_path: str, tenant_token: st
         properties = data.get("properties", {})
         file_title = properties.get("title", "")
         
-        # 获取第一个 sheet
+        # 获取所有 sheet
         sheets = data.get("sheets", [])
         if not sheets:
             return False, "no_sheets", None
         
-        sheet_id = sheets[0].get("sheetId")
-        if not sheet_id:
-            return False, "invalid_sheet_id", None
-        
-        # 步骤2: 读取数据
-        read_url = f"{open_base}/open-apis/sheets/v2/spreadsheets/{file_token}/values/{sheet_id}"
-        resp = requests.get(read_url, headers=headers, timeout=30)
-        
-        if resp.status_code == 403:
-            return False, "permission_denied", None
-        if resp.status_code == 404:
-            return False, "file_not_found", None
-        if resp.status_code != 200:
-            return False, f"api_error: status_code={resp.status_code}", None
-        
-        read_data = resp.json()
-        if read_data.get("code") != 0:
-            error_msg = read_data.get("msg", "unknown")
-            if "permission" in error_msg.lower() or "access" in error_msg.lower():
+        # 步骤2: 读取所有sheet的数据
+        all_sheets_data = {}
+        for sheet in sheets:
+            sheet_id = sheet.get("sheetId")
+            sheet_title = sheet.get("title", f"Sheet{sheet_id}")
+            
+            if not sheet_id:
+                continue
+            
+            # 读取每个sheet的数据
+            read_url = f"{open_base}/open-apis/sheets/v2/spreadsheets/{file_token}/values/{sheet_id}"
+            resp = requests.get(read_url, headers=headers, timeout=30)
+            
+            if resp.status_code == 403:
                 return False, "permission_denied", None
-            if "not found" in error_msg.lower():
+            if resp.status_code == 404:
                 return False, "file_not_found", None
-            return False, f"api_error: {error_msg}", None
+            if resp.status_code != 200:
+                # 某个sheet读取失败，跳过
+                continue
+            
+            read_data = resp.json()
+            if read_data.get("code") != 0:
+                # 某个sheet读取失败，跳过
+                continue
+            
+            # 步骤3: 解析数据
+            value_range = read_data.get("data", {}).get("valueRange", {})
+            values = value_range.get("values", [])
+            
+            if values:
+                # 转换为 DataFrame（第一行作为表头）
+                if len(values) > 0:
+                    df = pd.DataFrame(values[1:], columns=values[0] if len(values) > 0 else None)
+                    all_sheets_data[sheet_title] = df
         
-        # 步骤3: 解析数据并转换为 Excel
-        value_range = read_data.get("data", {}).get("valueRange", {})
-        values = value_range.get("values", [])
-        
-        if not values:
+        if not all_sheets_data:
             return False, "empty_data", None
         
-        # 转换为 DataFrame
-        df = pd.DataFrame(values)
-        
-        # 保存为 Excel
-        df.to_excel(output_path, index=False, header=False, engine='openpyxl')
+        # 步骤4: 保存为Excel
+        # 如果只有一个sheet，保持原有行为（无表头，兼容旧格式）
+        # 如果有多个sheet，保存为多sheet Excel（有表头）
+        if len(all_sheets_data) == 1:
+            # 单sheet：保持原有格式（无表头）
+            df = list(all_sheets_data.values())[0]
+            # 如果没有表头，使用原有逻辑：直接使用values
+            # 这里我们需要重新读取一次，因为DataFrame可能已经丢失了原始数据
+            first_sheet = sheets[0]
+            sheet_id = first_sheet.get("sheetId")
+            read_url = f"{open_base}/open-apis/sheets/v2/spreadsheets/{file_token}/values/{sheet_id}"
+            resp = requests.get(read_url, headers=headers, timeout=30)
+            read_data = resp.json()
+            value_range = read_data.get("data", {}).get("valueRange", {})
+            values = value_range.get("values", [])
+            df = pd.DataFrame(values)
+            df.to_excel(output_path, index=False, header=False, engine='openpyxl')
+        else:
+            # 多sheet：保存为多sheet Excel（有表头）
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                for sheet_name, df in all_sheets_data.items():
+                    # 清理sheet名称（Excel sheet名称限制）
+                    safe_sheet_name = sheet_name[:31]  # Excel sheet名称最长31字符
+                    df.to_excel(writer, sheet_name=safe_sheet_name, index=False, header=True)
         
         # 验证文件是否生成成功
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:

@@ -9,11 +9,14 @@ import requests
 from flask import Flask, request, jsonify, send_from_directory
 from dotenv import load_dotenv
 from .security import verify_signature
+import pandas as pd
+from typing import Optional
 
 # 北京时间 (UTC+8)
 BEIJING_TZ = timezone(timedelta(hours=8))
 from . import pull_bitable
 from . import cloud_doc_download
+from .multi_sheet_converter import convert_multi_sheet_to_wide_format
 import re
 
 # 先加载 .env（如果存在）
@@ -229,12 +232,58 @@ def get_beijing_timestamp() -> str:
     return datetime.now(BEIJING_TZ).strftime("%Y%m%d_%H%M%S")
 
 
+def detect_and_convert_multi_sheet(excel_file_path: str) -> tuple[bool, Optional[str]]:
+    """
+    检测Excel是否为多sheet长格式，如果是则转换为宽格式
+    
+    Returns:
+        (是否需要转换, 转换后的文件路径或None)
+    """
+    try:
+        # 读取所有sheet
+        excel_data = pd.read_excel(excel_file_path, sheet_name=None, header=0)
+        
+        # 如果只有一个sheet，不需要转换
+        if len(excel_data) == 1:
+            return False, None
+        
+        # 检查第一个sheet是否符合长格式（阶段、项目名称、费用、说明）
+        first_sheet = list(excel_data.values())[0]
+        required_cols = ['阶段', '项目名称', '费用', '说明']
+        
+        if not all(col in first_sheet.columns for col in required_cols):
+            # 不符合长格式，可能是宽格式，不需要转换
+            return False, None
+        
+        # 符合多sheet长格式，需要转换
+        app.logger.info(f"[多sheet检测] 检测到多sheet长格式Excel，开始转换")
+        wide_file_path = convert_multi_sheet_to_wide_format(excel_file_path)
+        return True, wide_file_path
+        
+    except Exception as e:
+        app.logger.warning(f"[多sheet检测] 检测失败，使用原文件: {e}")
+        return False, None
+
+
 def generate_sankey_and_notify(excel_file_path: str, base_name: str) -> tuple[bool, str]:
-    """生成桑基图
+    """生成桑基图（支持多sheet长格式自动转换）
     返回: (是否成功, HTML文件路径或错误类型)
     错误类型: "format_error" 表示 Excel 格式不符合要求
     """
     app.logger.info(f"[桑基图生成] 开始处理，Excel文件: {excel_file_path}, Base名称: {base_name}")
+    
+    # 检测并转换多sheet长格式
+    needs_conversion, converted_file = detect_and_convert_multi_sheet(excel_file_path)
+    converted_file_to_cleanup = None
+    
+    if needs_conversion and converted_file:
+        app.logger.info(f"[桑基图生成] 已转换为宽格式: {converted_file}")
+        # 使用转换后的文件
+        converted_file_to_cleanup = converted_file
+        excel_file_path = converted_file
+        # 更新base_name（用于文件命名）
+        excel_basename = os.path.splitext(os.path.basename(converted_file))[0]
+        base_name = excel_basename.replace("_宽格式", "")
     
     if SankeyService is None:
         app.logger.error("[桑基图生成] 失败：SankeyService 未初始化，可能是导入失败")
@@ -333,6 +382,14 @@ def generate_sankey_and_notify(excel_file_path: str, base_name: str) -> tuple[bo
             except Exception as e:
                 app.logger.warning(f"[桑基图生成] 删除临时边表文件失败: {e}")
             
+            # 清理转换后的临时文件（如果是多sheet转换生成的）
+            if converted_file_to_cleanup and os.path.exists(converted_file_to_cleanup):
+                try:
+                    os.remove(converted_file_to_cleanup)
+                    app.logger.info(f"[桑基图生成] 已删除临时转换文件: {os.path.basename(converted_file_to_cleanup)}")
+                except Exception as e:
+                    app.logger.warning(f"[桑基图生成] 删除临时转换文件失败: {e}")
+            
             # 返回可访问的 HTTP URL
             base_url = get_sankey_html_base_url()
             html_url = f"{base_url}/{urllib.parse.quote(html_filename)}"
@@ -347,6 +404,14 @@ def generate_sankey_and_notify(excel_file_path: str, base_name: str) -> tuple[bo
                     app.logger.info(f"[桑基图生成] 已删除临时边表文件: {os.path.basename(edges_file_path)}")
             except Exception as e:
                 app.logger.warning(f"[桑基图生成] 删除临时边表文件失败: {e}")
+            
+            # 清理转换后的临时文件（如果是多sheet转换生成的）
+            if converted_file_to_cleanup and os.path.exists(converted_file_to_cleanup):
+                try:
+                    os.remove(converted_file_to_cleanup)
+                    app.logger.info(f"[桑基图生成] 已删除临时转换文件: {os.path.basename(converted_file_to_cleanup)}")
+                except Exception as e:
+                    app.logger.warning(f"[桑基图生成] 删除临时转换文件失败: {e}")
             
             return False, "桑基图生成失败"
             
@@ -732,35 +797,32 @@ def feishu_events():
                                 reply_message(message_id, "多维表格中没有可用的表，请检查链接是否正确")
                                 return jsonify({"ok": "received"}), 200
                             tables = rt["data"]["items"]
-                            table_id = None
-                            if BASE_AUTO_PICK == "first" or not BASE_PREFERRED_TABLE:
+                            # 如果只有一个table，使用原有逻辑；如果有多个table，拉取所有table
+                            if len(tables) == 1:
                                 table_id = tables[0]["table_id"]
                             else:
-                                for t in tables:
-                                    if t.get("name") == BASE_PREFERRED_TABLE:
-                                        table_id = t["table_id"]
-                                        break
-                                if not table_id:
-                                    table_id = tables[0]["table_id"]
+                                # 多个table：设置为None，让pull_to_files拉取所有table
+                                table_id = None
 
-                            # 尝试第一视图（可选）
+                            # 尝试第一视图（可选，仅在指定table_id时）
                             view_id = None
-                            try:
-                                url_views = f"{OPEN_BASE}/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/views"
-                                rv = requests.get(url_views, headers=headers, params={"page_size": 200}, timeout=10).json()
-                                if rv.get("code") == 0 and rv.get("data", {}).get("items"):
-                                    views = rv["data"]["items"]
-                                    if BASE_AUTO_PICK == "first" or not BASE_PREFERRED_VIEW:
-                                        view_id = views[0]["view_id"]
-                                    else:
-                                        for v in views:
-                                            if v.get("name") == BASE_PREFERRED_VIEW:
-                                                view_id = v["view_id"]
-                                                break
-                                        if not view_id:
+                            if table_id:  # 只有在指定table_id时才获取view_id
+                                try:
+                                    url_views = f"{OPEN_BASE}/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/views"
+                                    rv = requests.get(url_views, headers=headers, params={"page_size": 200}, timeout=10).json()
+                                    if rv.get("code") == 0 and rv.get("data", {}).get("items"):
+                                        views = rv["data"]["items"]
+                                        if BASE_AUTO_PICK == "first" or not BASE_PREFERRED_VIEW:
                                             view_id = views[0]["view_id"]
-                            except Exception:
-                                pass
+                                        else:
+                                            for v in views:
+                                                if v.get("name") == BASE_PREFERRED_VIEW:
+                                                    view_id = v["view_id"]
+                                                    break
+                                            if not view_id:
+                                                view_id = views[0]["view_id"]
+                                except Exception:
+                                    pass
 
                             # 获取多维表格（base）名称
                             base_name = get_base_name(OPEN_BASE, app_token, token)

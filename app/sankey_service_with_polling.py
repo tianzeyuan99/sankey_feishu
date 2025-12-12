@@ -318,7 +318,10 @@ class SankeyService:
             return {}
 
     def compute_phase_totals(self, budget_file):
-        """按会议读取"总预算"(最后一列)，返回 (别名, 会议名称, 总预算) 列表，用于标题下方展示"""
+        """按sheet读取"总预算"(最后一列)，返回 (别名, sheet时间, 总预算) 列表，用于标题下方展示
+        时间列格式：sheet_name_phase，显示为sheet的时间
+        总预算保留8位小数，并进行验证
+        """
         if not os.path.exists(budget_file):
             return []
         try:
@@ -327,23 +330,41 @@ class SankeyService:
             total_col = budget_df.columns[-1]  # 最后一列：总预算
 
             meetings = budget_df[time_col].dropna().tolist()
-            meeting_aliases = ["初始", "第一次", "第二次", "第三次", "第四次", "第五次"]
-            phase_info = []  # [(alias, phase_name, total), ...]
+            phase_info = []  # [(alias, sheet_time, total), ...]
 
             for i, meeting in enumerate(meetings):
-                alias = meeting_aliases[i] if i < len(meeting_aliases) else f"第{i+1}次"
-                # 会议名称：用括号内的时间说明；如果没有括号就用整串
-                if "(" in str(meeting) and ")" in str(meeting):
-                    phase_name = str(meeting).split("(", 1)[1].rsplit(")", 1)[0]
+                meeting_str = str(meeting)
+                
+                # 提取sheet名称：时间列格式为 sheet_name_phase
+                # 例如：25年_25年预算 -> 只显示 25年（第一个下划线之前的部分）
+                if "_" in meeting_str:
+                    # 格式：sheet_name_phase，只取第一个下划线之前的部分（sheet名称）
+                    sheet_time = meeting_str.split("_", 1)[0]  # 只取第一个部分（sheet名称）
                 else:
-                    phase_name = str(meeting)
-
+                    sheet_time = meeting_str
+                
                 row = budget_df[budget_df[time_col] == meeting]
                 v = row[total_col].iloc[0]
                 if pd.notnull(v):
                     try:
-                        phase_info.append((alias, phase_name, float(v)))
-                    except Exception:
+                        # 总预算保留8位小数（预算金额要严谨）
+                        total_value = round(float(v), 8)
+                        
+                        # 验证：从项目列计算总预算，验证是否一致
+                        project_cols = [col for col in budget_df.columns[1:-1] if not col.endswith('_说明')]
+                        calculated_sum = 0.0
+                        for col in project_cols:
+                            col_value = row[col].iloc[0]
+                            if pd.notnull(col_value):
+                                calculated_sum = round(calculated_sum + round(float(col_value), 8), 8)
+                        
+                        # 验证总预算（允许浮点数误差）
+                        if abs(calculated_sum - total_value) > 0.00000001:
+                            self.logger.warning(f"总预算验证不一致: 时间列={meeting_str}, 总预算列={total_value}, 计算值={calculated_sum}")
+                        
+                        phase_info.append((None, sheet_time, total_value))  # 不使用alias
+                    except Exception as e:
+                        self.logger.warning(f"处理总预算时出错: {meeting_str}, 错误: {e}")
                         continue
             return phase_info
         except Exception as e:
@@ -548,22 +569,55 @@ class SankeyService:
     def get_chart_title(self, budget_path):
         if budget_path and os.path.exists(budget_path):
             base_name = os.path.splitext(os.path.basename(budget_path))[0]
-            return f"{base_name}-桑基图"
+            # 简化文件名：去掉时间戳和ID部分
+            # 格式：文件名-ou_xxx-时间戳_宽格式 -> 文件名
+            import re
+            # 提取第一个"-"之前的部分，或者提取到第一个时间戳（8位数字）之前
+            # 例如：Untitled bitable-ou_xxx-20251212_155226_宽格式 -> Untitled bitable
+            parts = base_name.split('-')
+            if len(parts) > 1:
+                # 如果第一部分看起来是文件名（不包含下划线和长ID），使用第一部分
+                first_part = parts[0]
+                # 检查是否包含ID格式（ou_开头或长字符串）
+                if 'ou_' not in first_part and len(first_part) < 50:
+                    simple_name = first_part
+                else:
+                    # 否则尝试提取到时间戳之前
+                    match = re.match(r'^([^-]+(?:-[^-]+)?)', base_name)
+                    if match:
+                        simple_name = match.group(1)
+                    else:
+                        simple_name = first_part
+            else:
+                simple_name = base_name
+            
+            # 去掉"宽格式"后缀
+            simple_name = simple_name.replace("_宽格式", "").replace("-宽格式", "").strip()
+            return f"{simple_name}-桑基图"
         else:
             return "桑基图"
 
     def _format_phase_totals_subtitle(self, phase_totals):
-        """格式化会议总预算副标题：别名：会议名称 合计：xxx"""
+        """格式化会议总预算副标题：sheet时间 合计：xxx（保留8位小数）"""
         if not phase_totals:
             return ""
         subtitle_parts = []
-        for alias, phase_name, total in phase_totals:
-            # 格式化金额：如果是整数显示整数，否则显示2位小数
-            if total == int(total):
-                total_str = f"{int(total):,}"
+        for alias, sheet_time, total in phase_totals:
+            # 格式化金额：保留8位小数（预算金额要严谨）
+            # 如果小数部分全为0，显示整数；否则显示最多8位小数（去掉末尾的0）
+            if abs(total - round(total)) < 0.00000001:  # 判断是否为整数
+                total_str = f"{int(round(total)):,}"
             else:
-                total_str = f"{total:,.2f}"
-            subtitle_parts.append(f"{alias}：{phase_name} 合计：{total_str}")
+                # 保留8位小数，去掉末尾的0
+                formatted = f"{total:.8f}".rstrip('0').rstrip('.')
+                # 添加千分位分隔符
+                if '.' in formatted:
+                    int_part, dec_part = formatted.split('.')
+                    total_str = f"{int(int_part):,}.{dec_part}"
+                else:
+                    total_str = f"{int(formatted):,}"
+            # 显示 sheet_time 和 total
+            subtitle_parts.append(f"{sheet_time} 合计：{total_str}")
         return " | ".join(subtitle_parts)
 
     def _calculate_subtitle_font_size(self, phase_totals):

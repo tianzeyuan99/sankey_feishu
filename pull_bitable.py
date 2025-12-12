@@ -196,25 +196,92 @@ def save_xlsx_with_order(
     return outfile_xlsx
 
 
+def list_all_tables(
+    open_base: str,
+    app_token: str,
+    tenant_token: str,
+) -> List[Dict[str, Any]]:
+    """获取多维表格中的所有table列表"""
+    headers = {"Authorization": f"Bearer {tenant_token}"}
+    url_tables = f"{open_base}/open-apis/bitable/v1/apps/{app_token}/tables"
+    params = {"page_size": 200}
+    r = requests.get(url_tables, headers=headers, params=params, timeout=10).json()
+    if r.get("code") != 0:
+        raise RuntimeError(f"list_tables failed: {r}")
+    return r["data"].get("items", [])
+
+
 def pull_to_files(
     open_base: str,
     app_id: str,
     app_secret: str,
     app_token: str,
-    table_id: str,
+    table_id: Optional[str],  # 改为Optional，如果为None则拉取所有table
     view_id: Optional[str],
     outfile: str,  # 应该是完整的 .xlsx 路径
 ) -> Dict[str, Any]:
     """End-to-end: fetch token, list records, save Excel only.
+    支持多table：如果table_id为None，则拉取所有table作为多个sheet。
     Returns dict with count and Excel file path.
     """
     token = get_tenant_access_token(open_base, app_id, app_secret)
-    items = list_bitable_records(open_base, app_token, table_id, token, view_id=view_id)
-    ordered_field_names = list_fields(open_base, app_token, table_id, token, view_id)
-    out: Dict[str, Any] = {"count": len(items)}
-    # 只导出 Excel
-    out["xlsx"] = save_xlsx_with_order(items, ordered_field_names, outfile)
-    return out
+    
+    # 如果table_id为None，拉取所有table
+    if table_id is None:
+        from openpyxl import Workbook
+        wb = Workbook()
+        # 删除默认sheet
+        wb.remove(wb.active)
+        
+        all_tables = list_all_tables(open_base, app_token, token)
+        total_count = 0
+        
+        for table in all_tables:
+            table_id_current = table.get("table_id")
+            table_name = table.get("name", f"Table_{table_id_current}")
+            
+            # 拉取该table的数据
+            items = list_bitable_records(open_base, app_token, table_id_current, token, view_id=view_id)
+            ordered_field_names = list_fields(open_base, app_token, table_id_current, token, view_id)
+            
+            # 创建sheet
+            safe_sheet_name = table_name[:31]  # Excel sheet名称最长31字符
+            ws = wb.create_sheet(title=safe_sheet_name)
+            
+            # 写入表头
+            ws.append(ordered_field_names)
+            
+            # 写入数据
+            for it in items:
+                r = it.get("fields", {}) or {}
+                row = []
+                for k in ordered_field_names:
+                    v = r.get(k)
+                    if isinstance(v, (list, dict)):
+                        cell = (
+                            "; ".join([json.dumps(x, ensure_ascii=False) if isinstance(x, dict) else str(x) for x in v])
+                            if isinstance(v, list)
+                            else json.dumps(v, ensure_ascii=False)
+                        )
+                    else:
+                        cell = v
+                    row.append(cell)
+                ws.append(row)
+            
+            total_count += len(items)
+        
+        # 保存Excel
+        os.makedirs(os.path.dirname(outfile), exist_ok=True)
+        wb.save(outfile)
+        
+        return {"count": total_count, "xlsx": outfile}
+    else:
+        # 原有逻辑：只拉取指定的table
+        items = list_bitable_records(open_base, app_token, table_id, token, view_id=view_id)
+        ordered_field_names = list_fields(open_base, app_token, table_id, token, view_id)
+        out: Dict[str, Any] = {"count": len(items)}
+        out["xlsx"] = save_xlsx_with_order(items, ordered_field_names, outfile)
+        return out
 
 
 def main(argv: Optional[List[str]] = None) -> int:

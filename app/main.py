@@ -165,13 +165,28 @@ def get_local_ip():
 def get_sankey_html_base_url():
     """获取桑基图HTML访问的基础URL
     如果.env中配置了SANKEY_HTML_BASE_URL，则使用配置的值
-    否则动态获取本机IP和端口生成URL
+    否则动态获取本机IP和端口生成URL（确保包含端口号）
     """
     # 1) 若显式配置了 BASE_URL，则优先使用（例如 Nginx 静态服务）
     if SANKEY_HTML_BASE_URL:
-        return SANKEY_HTML_BASE_URL.rstrip("/")
-    # 2) 否则使用当前服务 (HOST, PORT) 暴露的 /sankey 路由
-    server_ip = get_local_ip() if HOST in ("0.0.0.0", "", None) else HOST
+        base_url = SANKEY_HTML_BASE_URL.rstrip("/")
+        # 确保配置的URL包含端口（如果不是标准端口80/443）
+        # 如果URL中没有端口号，且不是标准端口，添加端口
+        from urllib.parse import urlparse
+        parsed = urlparse(base_url)
+        if not parsed.port and PORT not in [80, 443]:
+            # URL中没有端口，且当前端口不是标准端口，需要添加
+            if parsed.scheme == "https":
+                # HTTPS默认443，如果配置了其他端口需要添加
+                if PORT != 443:
+                    base_url = f"{parsed.scheme}://{parsed.netloc}:{PORT}{parsed.path}"
+            else:
+                # HTTP默认80，如果配置了其他端口需要添加
+                if PORT != 80:
+                    base_url = f"{parsed.scheme}://{parsed.netloc}:{PORT}{parsed.path}"
+        return base_url
+    # 2) 否则使用固定的服务器IP和端口生成URL
+    server_ip = "10.77.79.147"  # 固定服务器IP
     return f"http://{server_ip}:{PORT}/sankey"
 
 # 简单的 tenant_access_token 内存缓存
